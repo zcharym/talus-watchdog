@@ -17,10 +17,9 @@
 | `status.taluship.com` | **NXDOMAIN — does not exist yet.** Needs a DNS record + a Worker to serve it. |
 | Cloudflare API access in this env | None (no token, no `wrangler` auth). v1 design avoids needing it. |
 
-> ⚠️ Retrieval (WebFetch / WebSearch) was unavailable in this environment, so specific
-> Cloudflare limits/config below are marked **[verify in docs]**. Confirm them at
-> https://developers.cloudflare.com/ before finalizing. Where docs and this plan
-> disagree, trust the docs.
+> ⚠️ Specific Cloudflare limits/config that were unverified when this plan was
+> drafted are now confirmed in the checklist at the bottom of this file.
+> Where docs and this plan disagree, trust the docs.
 
 ---
 
@@ -96,6 +95,10 @@ At 1 check/min × 2 targets ≈ **2,880 rows/day ≈ 1M rows/year**. Plan:
 - Keep **raw checks for 30–90 days**, then roll up to **hourly/daily buckets**
   (uptime %, p95 latency, incident count) for the 90-day and long-historical views.
 - A weekly compaction step (extra cron or a branch in the 1-min cron) archives old rows.
+  **Implemented:** hourly branch rolls today+yesterday into `daily_aggregates` (and each
+  check O(1)-bumps today's counters); raw `checks` older than 90 days are pruned.
+  The status page reads aggregates for 7/30/90d bars — never a live 90d `GROUP BY`
+  on `checks` (that would burn D1 rows-read quota).
 - **[verify in docs]** D1 max DB size and rows-read/written-per-day on free vs paid — these
   drive the exact retention window.
 
@@ -164,6 +167,8 @@ CREATE TABLE daily_aggregates (
   uptime_pct       REAL NOT NULL,
   p95_latency_ms   INTEGER,
   incident_count   INTEGER NOT NULL DEFAULT 0,
+  ok_count         INTEGER NOT NULL DEFAULT 0,  -- added in migration 0002
+  total            INTEGER NOT NULL DEFAULT 0,  -- added in migration 0002
   PRIMARY KEY (day, target)
 );
 ```
@@ -186,12 +191,16 @@ CREATE TABLE daily_aggregates (
 ## Phased plan
 
 ### Phase 0 — Decisions (confirm before building)
-- [ ] Confirm targets (`app.taluship.com` + apex) and whether the product Worker can expose a
+- [x] Confirm targets (`app.taluship.com` + apex) and whether the product Worker can expose a
       `/health` endpoint for content checks (preferred over scraping HTML).
-- [ ] Confirm check interval (recommend **1 min**) and thresholds (2 = degraded, 5 = outage).
-- [ ] **[verify in docs]:** cron min interval & max crons/Worker; D1 storage + rows-read/day
+      → v1 targets set in `src/config.ts`; content check optional via `expectedContent`
+      (no `/health` required for launch).
+- [x] Confirm check interval (recommend **1 min**) and thresholds (2 = degraded, 5 = outage).
+      → `* * * * *`; thresholds in `THRESHOLDS`.
+- [x] **[verify in docs]:** cron min interval & max crons/Worker; D1 storage + rows-read/day
       limits; Workers Custom Domain auto-DNS; `fetch` + `AbortController` timeout; scheduled
       handler CPU/subrequest limits.
+      → see checklist at bottom of this file.
 
 ### Phase 1 — Scaffold
 - `git init`, `.gitignore`, `package.json` (wrangler, `@cloudflare/workers-types`, typescript, vitest).
@@ -237,9 +246,22 @@ CREATE TABLE daily_aggregates (
 
 ---
 
-## Verify-before-deploy checklist (retrieval was blocked here)
-- [ ] Cron: minimum interval (expect 1 min) and max cron triggers per Worker.
-- [ ] D1: max DB size, rows read/written per day on free vs paid → drives retention window.
-- [ ] Workers Custom Domain: confirms it auto-creates the proxied DNS record in the existing zone.
-- [ ] Scheduled handler: CPU time limit; confirm `fetch` subrequest limits apply.
-- [ ] `fetch()` + `AbortController` timeout support and any default timeout.
+## Verify-before-deploy checklist
+
+Confirmed against Cloudflare docs (2026-08):
+
+- [x] **Cron:** minimum interval is **1 minute**; max cron triggers per Worker is
+      **3 (Free) / 5 (Paid)**. v1 uses a single `* * * * *` trigger.
+- [x] **D1 Free:** 500 MB/DB, 5 GB account storage, **5M rows read/day**,
+      **100k rows written/day**. Paid removes the daily caps (usage-based).
+      v1 write load is fine on Free (~10–15k writes/day). Read load depends on
+      uncached page views — historical uptime is served from `daily_aggregates`
+      (not a live 90d scan of `checks`) and responses are Cache-API cached ~30s.
+      **Workers Paid is recommended** once the page sees regular traffic.
+- [x] **Workers Custom Domain:** auto-creates the proxied DNS record + cert in
+      the zone. Confirmed in
+      https://developers.cloudflare.com/workers/configuration/routing/custom-domains/
+- [x] **Scheduled handler:** same CPU/subrequest limits as `fetch` (Free: 10ms
+      CPU / 50 subrequests — tight for 3 outbound checks; **Paid recommended**).
+- [x] **`fetch` + `AbortController`:** supported; v1 uses `AbortController` +
+      `setTimeout` (8s). `AbortSignal.timeout(ms)` is also available.

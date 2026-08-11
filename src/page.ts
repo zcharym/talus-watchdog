@@ -6,6 +6,7 @@
 import {
   RETENTION_DAYS,
   STALE_BANNER_THRESHOLD_MS,
+  TARGETS,
 } from "./config";
 import {
   getComponents,
@@ -169,10 +170,17 @@ export async function buildStatusModel(
   const stale =
     lastCheckAt == null || now - lastCheckAt > STALE_BANNER_THRESHOLD_MS;
 
+  const controlSlugs = new Set(TARGETS.filter((t) => t.control).map((t) => t.slug));
+  const productStatuses = components
+    .filter((c) => !controlSlugs.has(c.slug))
+    .map((c) => c.current_status);
+
   return {
-    overall: components.length
-      ? overallStatus(components.map((c) => c.current_status))
-      : "unknown",
+    overall: productStatuses.length
+      ? overallStatus(productStatuses)
+      : components.length
+        ? overallStatus(components.map((c) => c.current_status))
+        : "unknown",
     lastCheckAt,
     stale,
     generatedAt: now,

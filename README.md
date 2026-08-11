@@ -52,7 +52,8 @@ src/
   page.ts       # HTML + /api/status JSON, pure uptime/percentile/format helpers
   config.ts     # targets, thresholds, timeouts, retention
 migrations/
-  0001_init.sql # D1 schema
+  0001_init.sql                    # D1 schema
+  0002_daily_aggregate_counts.sql  # ok_count/total on daily_aggregates
 test/
   checker.test.ts  # unit tests for applyCheck + page helpers
 ```
@@ -125,8 +126,11 @@ page that silently stops updating is worse than no status page.
   could take down both the product and the watchdog. v2 mitigations (an
   external checker, highly-cacheable page) are in the backlog.
 - `colo` is left `NULL`: it isn't exposed to `scheduled` events.
-- 90-day uptime is computed **live** from `checks` (raw data is retained 90
-  days, pruned hourly). `daily_aggregates` exists for future >90-day history.
-- `[verify in docs]` items in `PLAN.md` (cron limits, D1 quotas, custom-domain
-  auto-DNS) should be confirmed against https://developers.cloudflare.com/
-  before finalizing.
+- 7/30/90-day uptime bars are served from **`daily_aggregates`** (bumped on
+  every check; fully recomputed with p95 hourly). Raw `checks` are retained
+  90 days for the 24h sparkline / p95 and then pruned.
+- Control target (`cloudflare`) is shown on the page but **excluded** from the
+  overall status badge.
+- **Workers Paid is recommended:** Free-plan CPU (10ms) is tight for 3 outbound
+  checks per cron tick, and uncached status-page traffic can burn D1's 5M
+  rows-read/day budget.

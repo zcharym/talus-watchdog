@@ -23,6 +23,7 @@ import {
   escalateIncident,
   resolveOpenIncident,
   pruneOldChecks,
+  rollupDailyAggregates,
   type ComponentRow,
 } from "./db";
 import { renderPage, statusJson } from "./page";
@@ -123,9 +124,11 @@ async function runChecks(env: Env, scheduledTime: number): Promise<void> {
     }
   }
 
-  // Compaction: prune raw checks older than RETENTION_DAYS, ~hourly.
+  // Compaction (~hourly): roll today+yesterday into daily_aggregates, then
+  // prune raw checks older than RETENTION_DAYS. Rollup must run before prune.
   try {
     if (new Date(scheduledTime).getUTCMinutes() === 0) {
+      await rollupDailyAggregates(db, now);
       await pruneOldChecks(db, now - RETENTION_DAYS * 86_400_000);
     }
   } catch (e) {
@@ -138,12 +141,23 @@ async function handleFetch(
   env: Env,
   ctx: ExecutionContext,
 ): Promise<Response> {
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    return new Response("Method Not Allowed", {
+      status: 405,
+      headers: { allow: "GET, HEAD" },
+    });
+  }
+
   const url = new URL(req.url);
   const now = Date.now();
 
+  // Cache API only stores GET; map HEAD → GET for lookup/put.
   const cache = caches.default;
-  const cached = await cache.match(req);
-  if (cached) return cached;
+  const cacheKey = new Request(url.toString(), { method: "GET" });
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    return req.method === "HEAD" ? new Response(null, cached) : cached;
+  }
 
   let response: Response;
   if (url.pathname === "/") {
@@ -166,7 +180,7 @@ async function handleFetch(
       "Cache-Control",
       `public, s-maxage=${PAGE_CACHE_TTL_S}`,
     );
-    ctx.waitUntil(cache.put(req, response.clone()));
+    ctx.waitUntil(cache.put(cacheKey, response.clone()));
   }
-  return response;
+  return req.method === "HEAD" ? new Response(null, response) : response;
 }

@@ -12,6 +12,9 @@ export interface Target {
   /** optional: substring expected in the response body (v1.5 content check).
    *  If set, a 200 that omits this string reads as "up but broken" -> failure. */
   expectedContent?: string;
+  /** If true, shown on the page but excluded from the overall status badge
+   *  (used for always-up control targets). */
+  control?: boolean;
 }
 
 /**
@@ -28,6 +31,7 @@ export const TARGETS: Target[] = [
     slug: "cloudflare",
     name: "Cloudflare (control)",
     url: "https://cloudflare.com",
+    control: true,
   },
 ];
 

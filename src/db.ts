@@ -40,6 +40,14 @@ export interface DailyBucket {
   total: number;
 }
 
+function utcDay(tsMs: number): string {
+  return new Date(tsMs).toISOString().slice(0, 10);
+}
+
+function dayStartMs(day: string): number {
+  return Date.parse(`${day}T00:00:00.000Z`);
+}
+
 /** Make sure every configured target has a components row. Idempotent. */
 export async function ensureComponentsSeeded(db: D1Database): Promise<void> {
   for (const t of TARGETS) {
@@ -82,21 +90,38 @@ export async function recordCheck(
   check: CheckResult,
   now: number,
 ): Promise<void> {
-  await db
-    .prepare(
-      `INSERT INTO checks (target, ts, status, latency_ms, ok, error, colo)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .bind(
-      check.target.slug,
-      now,
-      check.status,
-      check.latencyMs,
-      check.ok ? 1 : 0,
-      check.error,
-      null, // colo isn't exposed in scheduled events; see PLAN.md insight 7
-    )
-    .run();
+  const day = utcDay(now);
+  const okInc = check.ok ? 1 : 0;
+
+  // Atomic: raw check + today's aggregate bump (status page reads aggregates
+  // for 7/30/90d — must not wait for the hourly full rollup).
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO checks (target, ts, status, latency_ms, ok, error, colo)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        check.target.slug,
+        now,
+        check.status,
+        check.latencyMs,
+        check.ok ? 1 : 0,
+        check.error,
+        null, // colo isn't exposed in scheduled events; see PLAN.md insight 7
+      ),
+    db
+      .prepare(
+        `INSERT INTO daily_aggregates
+           (day, target, uptime_pct, p95_latency_ms, incident_count, ok_count, total)
+         VALUES (?, ?, ?, NULL, 0, ?, 1)
+         ON CONFLICT(day, target) DO UPDATE SET
+           ok_count = ok_count + excluded.ok_count,
+           total = total + 1,
+           uptime_pct = 100.0 * (ok_count + excluded.ok_count) / (total + 1)`,
+      )
+      .bind(day, check.target.slug, check.ok ? 100 : 0, okInc),
+  ]);
 }
 
 export async function updateComponent(
@@ -184,26 +209,114 @@ export async function getChecksSince(
   return res.results ?? [];
 }
 
-/** per-day uptime buckets for the last `sinceMs`. */
+/**
+ * Per-day uptime buckets from `daily_aggregates` (not a live scan of `checks`).
+ * Populated by `rollupDailyAggregates` during hourly compaction.
+ */
 export async function getDailyBucketsSince(
   db: D1Database,
   slug: string,
   sinceMs: number,
 ): Promise<DailyBucket[]> {
+  const sinceDay = utcDay(sinceMs);
   const res = await db
     .prepare(
-      `SELECT
-         date(ts / 1000, 'unixepoch') AS day,
-         SUM(ok) AS ok_count,
-         COUNT(*) AS total
-       FROM checks
-       WHERE target = ? AND ts >= ?
-       GROUP BY day
+      `SELECT day, ok_count, total
+       FROM daily_aggregates
+       WHERE target = ? AND day >= ?
        ORDER BY day ASC`,
     )
-    .bind(slug, sinceMs)
+    .bind(slug, sinceDay)
     .all<DailyBucket>();
   return res.results ?? [];
+}
+
+/**
+ * Roll recent calendar days into `daily_aggregates` so the status page can
+ * serve 7/30/90d views without scanning hundreds of thousands of raw checks
+ * (D1 bills rows scanned — a live 90d GROUP BY blows free-tier read quotas).
+ *
+ * Recomputes today + yesterday only (~2 × 1440 rows/target) — call hourly.
+ */
+export async function rollupDailyAggregates(
+  db: D1Database,
+  now: number,
+): Promise<void> {
+  const today = utcDay(now);
+  const yesterday = utcDay(now - 86_400_000);
+  const days = [yesterday, today];
+
+  for (const target of TARGETS) {
+    for (const day of days) {
+      const start = dayStartMs(day);
+      const end = start + 86_400_000;
+
+      const stats = await db
+        .prepare(
+          `SELECT
+             COALESCE(SUM(ok), 0) AS ok_count,
+             COUNT(*) AS total
+           FROM checks
+           WHERE target = ? AND ts >= ? AND ts < ?`,
+        )
+        .bind(target.slug, start, end)
+        .first<{ ok_count: number; total: number }>();
+
+      const ok_count = Number(stats?.ok_count ?? 0);
+      const total = Number(stats?.total ?? 0);
+      if (total === 0) continue;
+
+      const latencies = await db
+        .prepare(
+          `SELECT latency_ms FROM checks
+           WHERE target = ? AND ts >= ? AND ts < ? AND latency_ms IS NOT NULL
+           ORDER BY latency_ms ASC`,
+        )
+        .bind(target.slug, start, end)
+        .all<{ latency_ms: number }>();
+      const vals = (latencies.results ?? []).map((r) => r.latency_ms);
+      let p95: number | null = null;
+      if (vals.length > 0) {
+        const idx = Math.max(
+          0,
+          Math.min(vals.length - 1, Math.ceil(0.95 * vals.length) - 1),
+        );
+        p95 = vals[idx];
+      }
+
+      const incidents = await db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM incidents
+           WHERE target = ? AND started_at >= ? AND started_at < ?`,
+        )
+        .bind(target.slug, start, end)
+        .first<{ n: number }>();
+
+      const uptime_pct = (ok_count * 100) / total;
+      await db
+        .prepare(
+          `INSERT INTO daily_aggregates
+             (day, target, uptime_pct, p95_latency_ms, incident_count, ok_count, total)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(day, target) DO UPDATE SET
+             uptime_pct = excluded.uptime_pct,
+             p95_latency_ms = excluded.p95_latency_ms,
+             incident_count = excluded.incident_count,
+             ok_count = excluded.ok_count,
+             total = excluded.total`,
+        )
+        .bind(
+          day,
+          target.slug,
+          uptime_pct,
+          p95,
+          Number(incidents?.n ?? 0),
+          ok_count,
+          total,
+        )
+        .run();
+    }
+  }
 }
 
 export async function getRecentIncidents(

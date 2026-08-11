@@ -1,31 +1,31 @@
-name = "talus-watchdog"
-main = "src/index.ts"
 compatibility_date = "2025-09-23"
+main = "src/index.ts"
+name = "talus-watchdog"
+
+# Keep *.workers.dev + version Preview URLs as backups alongside the custom domain.
+preview_urls = true
+workers_dev = true
+
+# Workers Custom Domain - serves the status page at https://status.taluship.com.
+# Must be top-level (not under [[d1_databases]]). Auto-creates the proxied DNS
+# record in the taluship.com zone on deploy.
+routes = [
+  {pattern = "status.taluship.com", custom_domain = true},
+]
 
 # Stream Worker logs in `wrangler tail` / dashboard.
 [observability]
 enabled = true
 
-# Synthetic health checks run every minute from Cloudflare's cron.
-# Min interval is 1 min; verify max crons/Worker in the Cloudflare docs.
+# Min interval is 1 min; Free allows up to 3 cron triggers per Worker (Paid: 5).
 [triggers]
 crons = ["* * * * *"]
 
 # D1 - source of truth: raw checks, incidents, components, daily rollups.
-# 1. `npm run db:create`  -> prints a database_id
-# 2. paste it below
-# 3. `npm run migrate:remote`
 [[d1_databases]]
 binding = "DB"
+database_id = "e8f1b95c-9151-46eb-ba79-d6590183315b"
 database_name = "watchdog-db"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
-
-# Workers Custom Domain - serves the status page at https://status.taluship.com.
-# Auto-creates the proxied DNS record in the taluship.com zone on deploy.
-# Uncomment after the DB is created + migrated, then `npm run deploy`.
-# routes = [
-#   { pattern = "status.taluship.com", custom_domain = true }
-# ]
 
 # Optional KV cache (v1 uses the Cache API for page caching instead).
 # Uncomment if read volume / D1 read cost becomes a concern and wire env.STATUS_CACHE in code.

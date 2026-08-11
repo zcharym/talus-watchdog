@@ -41,8 +41,10 @@ CREATE TABLE components (
   last_check_at        INTEGER                     -- epoch ms; NULL until first check
 );
 
--- daily rollups for >90-day historical views (populated by a future compaction step;
--- v1 computes the 90-day view live from `checks` since raw data is retained 90 days).
+-- daily rollups for 7/30/90d views + >90-day history.
+-- Populated hourly by rollupDailyAggregates (see src/db.ts). The status page
+-- reads these instead of GROUP BY-ing raw `checks` (D1 bills rows scanned).
+-- ok_count/total are added in 0002_daily_aggregate_counts.sql.
 CREATE TABLE daily_aggregates (
   day              TEXT NOT NULL,      -- 'YYYY-MM-DD' (UTC)
   target           TEXT NOT NULL,
